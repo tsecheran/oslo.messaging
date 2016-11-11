@@ -15,6 +15,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import copy
 import logging
 import sys
@@ -32,6 +33,7 @@ from oslo_messaging import _utils as utils
 LOG = logging.getLogger(__name__)
 
 _EXCEPTIONS_MODULE = 'exceptions' if six.PY2 else 'builtins'
+_EXCEPTIONS_MODULES = ['exceptions', 'builtins']
 
 
 '''RPC Envelope Version.
@@ -85,7 +87,8 @@ class RPCException(Exception):
             except Exception:
                 # kwargs doesn't match a variable in the message
                 # log the issue and the kwargs
-                LOG.exception(_LE('Exception in string format operation'))
+                LOG.exception(_LE('Exception in string format operation, '
+                                  'kwargs are:'))
                 for name, value in six.iteritems(kwargs):
                     LOG.error("%s: %s", name, value)
                 # at least get the core message out if something happened
@@ -109,7 +112,7 @@ class Timeout(RPCException):
 
         :param info: Extra info to convey to the user
         :param topic: The topic that the rpc call was sent to
-        :param rpc_method_name: The name of the rpc method being
+        :param method: The name of the rpc method being
                                 called
         """
         self.info = info
@@ -161,18 +164,15 @@ class Connection(object):
         raise NotImplementedError()
 
 
-def serialize_remote_exception(failure_info, log_failure=True):
+def serialize_remote_exception(failure_info):
     """Prepares exception data to be sent over rpc.
 
     Failure_info should be a sys.exc_info() tuple.
 
     """
     tb = traceback.format_exception(*failure_info)
+
     failure = failure_info[1]
-    if log_failure:
-        LOG.error(_LE("Returning exception %s to caller"),
-                  six.text_type(failure))
-        LOG.error(tb)
 
     kwargs = {}
     if hasattr(failure, 'kwargs'):
@@ -208,6 +208,13 @@ def deserialize_remote_exception(data, allowed_remote_exmods):
     message = failure.get('message', "") + "\n" + "\n".join(trace)
     name = failure.get('class')
     module = failure.get('module')
+
+    # the remote service which raised the given exception might have a
+    # different python version than the caller. For example, the caller might
+    # run python 2.7, while the remote service might run python 3.4. Thus,
+    # the exception module will be "builtins" instead of "exceptions".
+    if module in _EXCEPTIONS_MODULES:
+        module = _EXCEPTIONS_MODULE
 
     # NOTE(ameade): We DO NOT want to allow just any module to be imported, in
     # order to prevent arbitrary code execution.
@@ -348,3 +355,163 @@ class DecayingTimer(object):
         if left <= 0 and timeout_callback is not None:
             timeout_callback(*args, **kwargs)
         return left if maximum is None else min(left, maximum)
+
+
+# NOTE(sileht): Even if rabbit has only one Connection class,
+# this connection can be used for two purposes:
+# * wait and receive amqp messages (only do read stuffs on the socket)
+# * send messages to the broker (only do write stuffs on the socket)
+# The code inside a connection class is not concurrency safe.
+# Using one Connection class instance for doing both, will result
+# of eventlet complaining of multiple greenthreads that read/write the
+# same fd concurrently... because 'send' and 'listen' run in different
+# greenthread.
+# So, a connection cannot be shared between thread/greenthread and
+# this two variables permit to define the purpose of the connection
+# to allow drivers to add special handling if needed (like heatbeat).
+# amqp drivers create 3 kind of connections:
+# * driver.listen*(): each call create a new 'PURPOSE_LISTEN' connection
+# * driver.send*(): a pool of 'PURPOSE_SEND' connections is used
+# * driver internally have another 'PURPOSE_LISTEN' connection dedicated
+#   to wait replies of rpc call
+PURPOSE_LISTEN = 'listen'
+PURPOSE_SEND = 'send'
+
+
+class ConnectionContext(Connection):
+    """The class that is actually returned to the create_connection() caller.
+
+    This is essentially a wrapper around Connection that supports 'with'.
+    It can also return a new Connection, or one from a pool.
+
+    The function will also catch when an instance of this class is to be
+    deleted.  With that we can return Connections to the pool on exceptions
+    and so forth without making the caller be responsible for catching them.
+    If possible the function makes sure to return a connection to the pool.
+    """
+
+    def __init__(self, connection_pool, purpose):
+        """Create a new connection, or get one from the pool."""
+        self.connection = None
+        self.connection_pool = connection_pool
+        pooled = purpose == PURPOSE_SEND
+        if pooled:
+            self.connection = connection_pool.get()
+        else:
+            # a non-pooled connection is requested, so create a new connection
+            self.connection = connection_pool.create(purpose)
+        self.pooled = pooled
+        self.connection.pooled = pooled
+
+    def __enter__(self):
+        """When with ConnectionContext() is used, return self."""
+        return self
+
+    def _done(self):
+        """If the connection came from a pool, clean it up and put it back.
+        If it did not come from a pool, close it.
+        """
+        if self.connection:
+            if self.pooled:
+                # Reset the connection so it's ready for the next caller
+                # to grab from the pool
+                try:
+                    self.connection.reset()
+                except Exception:
+                    LOG.exception(_LE("Fail to reset the connection, drop it"))
+                    try:
+                        self.connection.close()
+                    except Exception:
+                        pass
+                    self.connection = self.connection_pool.create()
+                finally:
+                    self.connection_pool.put(self.connection)
+            else:
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+            self.connection = None
+
+    def __exit__(self, exc_type, exc_value, tb):
+        """End of 'with' statement.  We're done here."""
+        self._done()
+
+    def __del__(self):
+        """Caller is done with this connection.  Make sure we cleaned up."""
+        self._done()
+
+    def close(self):
+        """Caller is done with this connection."""
+        self._done()
+
+    def __getattr__(self, key):
+        """Proxy all other calls to the Connection instance."""
+        if self.connection:
+            return getattr(self.connection, key)
+        else:
+            raise InvalidRPCConnectionReuse()
+
+
+class ConfigOptsProxy(collections.Mapping):
+    """Proxy for oslo_config.cfg.ConfigOpts.
+
+    Values from the query part of the transport url (if they are both present
+    and valid) override corresponding values from the configuration.
+    """
+
+    def __init__(self, conf, url):
+        self._conf = conf
+        self._url = url
+
+    def __getattr__(self, name):
+        value = getattr(self._conf, name)
+        if isinstance(value, self._conf.GroupAttr):
+            return self.GroupAttrProxy(self._conf, name, value, self._url)
+        return value
+
+    def __getitem__(self, name):
+        return self.__getattr__(name)
+
+    def __contains__(self, name):
+        return name in self._conf
+
+    def __iter__(self):
+        return iter(self._conf)
+
+    def __len__(self):
+        return len(self._conf)
+
+    class GroupAttrProxy(collections.Mapping):
+        """Internal helper proxy for oslo_config.cfg.ConfigOpts.GroupAttr."""
+
+        _VOID_MARKER = object()
+
+        def __init__(self, conf, group_name, group, url):
+            self._conf = conf
+            self._group_name = group_name
+            self._group = group
+            self._url = url
+
+        def __getattr__(self, opt_name):
+            # Make sure that the group has this specific option
+            opt_value_conf = getattr(self._group, opt_name)
+            # If the option is also present in the url and has a valid
+            # (i.e. convertible) value type, then try to override it
+            opt_value_url = self._url.query.get(opt_name, self._VOID_MARKER)
+            if opt_value_url is self._VOID_MARKER:
+                return opt_value_conf
+            opt_info = self._conf._get_opt_info(opt_name, self._group_name)
+            return opt_info['opt'].type(opt_value_url)
+
+        def __getitem__(self, opt_name):
+            return self.__getattr__(opt_name)
+
+        def __contains__(self, opt_name):
+            return opt_name in self._group
+
+        def __iter__(self):
+            return iter(self._group)
+
+        def __len__(self):
+            return len(self._group)
