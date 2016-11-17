@@ -14,11 +14,13 @@
 #    under the License.
 
 import abc
-
+import time
 import six
 
 from oslo_config import cfg
+from oslo_utils import timeutils
 from oslo_messaging import exceptions
+from six.moves import range as compat_range
 
 base_opts = [
     cfg.IntOpt('rpc_conn_pool_size',
@@ -26,6 +28,30 @@ base_opts = [
                deprecated_group='DEFAULT',
                help='Size of RPC connection pool.'),
 ]
+
+
+def batch_poll_helper(func):
+    """Decorator to poll messages in batch
+    This decorator helps driver that polls message one by one,
+    to returns a list of message.
+    """
+    def wrapper(in_self, timeout=None, prefetch_size=1):
+        incomings = []
+        driver_prefetch = in_self.prefetch_size
+        if driver_prefetch > 0:
+            prefetch_size = min(prefetch_size, driver_prefetch)
+        watch = timeutils.StopWatch(duration=timeout)
+        with watch:
+            for __ in compat_range(prefetch_size):
+                msg = func(in_self, timeout=watch.leftover(return_none=True))
+                if msg is not None:
+                    incomings.append(msg)
+                else:
+                    # timeout reached or listener stopped
+                    break
+                time.sleep(0)
+        return incomings
+    return wrapper
 
 
 class TransportDriverError(exceptions.MessagingException):
@@ -54,14 +80,23 @@ class IncomingMessage(object):
 
 
 @six.add_metaclass(abc.ABCMeta)
+class RpcIncomingMessage(IncomingMessage):
+
+    @abc.abstractmethod
+    def reply(self, reply=None, failure=None, log_failure=True):
+        "Send a reply or failure back to the client."
+
+
+@six.add_metaclass(abc.ABCMeta)
 class Listener(object):
 
     def __init__(self, driver):
         self.conf = driver.conf
         self.driver = driver
+        self.prefetch_size = -1
 
     @abc.abstractmethod
-    def poll(self, timeout=None):
+    def poll(self, timeout=None, prefetch_size=1):
         """Blocking until a message is pending and return IncomingMessage.
         Return None after timeout seconds if timeout is set and no message is
         ending or if the listener have been stopped.
